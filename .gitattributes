@@ -1,3 +1,4 @@
+*.pt filter=lfs diff=lfs merge=lfs -text
 examples/soccer/data/football-ball-detection.pt filter=lfs diff=lfs merge=lfs -text
 examples/soccer/data/football-pitch-detection.pt filter=lfs diff=lfs merge=lfs -text
 examples/soccer/data/football-player-detection.pt filter=lfs diff=lfs merge=lfs -text
