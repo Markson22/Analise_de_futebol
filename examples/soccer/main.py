@@ -29,20 +29,13 @@ from sports.common.team import (
     TeamClassifier,
 )  # Funções para detecção e anotação de equipe.
 from sports.common.view import ViewTransformer  # Funções para transformação de visão.
+from sports.common.offside import (
+    OffsideDetector,
+    OffsideConfig,
+)  # Funções para detecção e anotação de impedimento.
 from sports.configs.soccer import (
     SoccerPitchConfiguration,
 )  # Configuração do campo de futebol (dimensões, layout).
-
-# Import condicional de impedimento (será carregado quando necessário)
-try:
-    from sports.common.offside import (
-        OffsideDetector,
-        OffsideConfig,
-    )
-    OFFSIDE_AVAILABLE = True
-except ImportError:
-    OFFSIDE_AVAILABLE = False
-    print("AVISO: Módulo de impedimento não disponível. Execute: pip install -e .")
 
 PARENT_DIR = os.path.dirname(
     os.path.abspath(__file__)
@@ -134,9 +127,6 @@ class Mode(Enum):
     )
     COMBINED_ANALYSIS = (
         "COMBINED_ANALYSIS"  # Análise combinada: jogadores com velocidade + bola
-    )
-    OFFSIDE_DETECTION = (
-        "OFFSIDE_DETECTION"  # Detecta e marca impedimento em tempo real
     )
 
 
@@ -615,247 +605,6 @@ def run_player_speed_estimation(
         yield annotated_frame
 
 
-def run_offside_detection(source_video_path: str, device: str) -> Iterator[np.ndarray]:
-    """
-    Execute detecção de impedimento com visualização dedicada.
-    
-    Este modo foca especificamente na detecção de impedimento, mostrando:
-    - Jogadores rastreados e classificados por time
-    - Bola rastreada
-    - Marcações de impedimento destacadas
-    - Linha de impedimento no campo
-    
-    Argumentos:
-        source_video_path (str): Caminho para o vídeo de origem.
-        device (str): Dispositivo para executar o modelo (por exemplo, 'cpu', 'cuda').
-        
-    Rendimentos:
-        Iterator[np.ndarray]: Iterador sobre quadros anotados.
-    """
-    if not OFFSIDE_AVAILABLE:
-        raise ImportError(
-            "Módulo de impedimento não disponível. "
-            "Execute 'pip install -e .' na raiz do projeto para instalar."
-        )
-    
-    import gc
-    import torch
-    
-    player_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
-    ball_model = YOLO(BALL_DETECTION_MODEL_PATH).to(device=device)
-    pitch_model = YOLO(PITCH_DETECTION_MODEL_PATH).to(device=device)
-    
-    # Fase 1: Coletar crops para treinamento do classificador de times
-    frame_generator = sv.get_video_frames_generator(
-        source_path=source_video_path, stride=STRIDE
-    )
-    crops = []
-    for frame in tqdm(frame_generator, desc="Treinando classificador de times"):
-        result = player_model(frame, imgsz=1280, verbose=False)[0]
-        detections = sv.Detections.from_ultralytics(result)
-        crops += get_crops(frame, detections[detections.class_id == PLAYER_CLASS_ID])
-    
-    team_classifier = TeamClassifier(device=device)
-    team_classifier.fit(crops)
-    
-    # Fase 2: Processamento focado em impedimento
-    video_info = sv.VideoInfo.from_video_path(source_video_path)
-    frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
-    
-    tracker = sv.ByteTrack(minimum_consecutive_frames=3, frame_rate=video_info.fps)
-    ball_tracker = BallTracker(buffer_size=20)
-    ball_annotator = BallAnnotator(radius=6, buffer_size=10)
-    
-    # Configuração destacada para impedimento
-    offside_config = OffsideConfig(
-        debounce_frames=5,
-        min_defenders=2,
-        depth_axis='x',
-        position_tolerance_cm=50.0,
-        enable_annotations=True,
-        offside_color=(0, 0, 255),  # Vermelho
-        circle_radius=40,  # Maior que o padrão
-        circle_thickness=4
-    )
-    offside_detector = OffsideDetector(config=offside_config)
-    
-    for frame in frame_generator:
-        try:
-            # Detecção de pitch
-            pitch_result = pitch_model(frame, verbose=False)[0]
-            keypoints = sv.KeyPoints.from_ultralytics(pitch_result)
-            
-            # Detecção de jogadores
-            player_result = player_model(frame, imgsz=1280, verbose=False)[0]
-            player_detections = sv.Detections.from_ultralytics(player_result)
-            player_detections = tracker.update_with_detections(player_detections)
-            
-        except RuntimeError as e:
-            if "memory" in str(e).lower():
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                print(f"AVISO: Limpeza de memória realizada. Frame pulado.")
-                yield frame
-                continue
-            else:
-                raise
-        
-        players = player_detections[player_detections.class_id == PLAYER_CLASS_ID]
-        goalkeepers = player_detections[player_detections.class_id == GOALKEEPER_CLASS_ID]
-        referees = player_detections[player_detections.class_id == REFEREE_CLASS_ID]
-        
-        # Processar times
-        if len(players) > 0:
-            crops = get_crops(frame, players)
-            players_team_id = team_classifier.predict(crops)
-        else:
-            players_team_id = np.array([], dtype=np.int32)
-        
-        if len(goalkeepers) > 0 and len(players) > 0:
-            goalkeepers_team_id = resolve_goalkeepers_team_id(
-                players, players_team_id, goalkeepers
-            )
-        else:
-            goalkeepers_team_id = np.array([], dtype=np.int32)
-        
-        # Detecção de bola
-        ball_result = ball_model(frame, imgsz=640, verbose=False)[0]
-        ball_detections = sv.Detections.from_ultralytics(ball_result)
-        ball_detections = ball_tracker.update(ball_detections)
-        
-        # Criar transformer
-        mask = (keypoints.xy[0][:, 0] > 1) & (keypoints.xy[0][:, 1] > 1)
-        transformer = None
-        if mask.sum() >= 4 and len(players) > 0:
-            transformer = ViewTransformer(
-                source=keypoints.xy[0][mask].astype(np.float32),
-                target=np.array(CONFIG.vertices)[mask].astype(np.float32),
-            )
-        
-        # Frame anotado
-        annotated_frame = frame.copy()
-        
-        # Anotar jogadores por time
-        if len(players) > 0 and len(players_team_id) > 0:
-            players_team_0_mask = players_team_id == 0
-            players_team_1_mask = players_team_id == 1
-            
-            players_team_0 = players[players_team_0_mask]
-            players_team_1 = players[players_team_1_mask]
-            
-            if len(players_team_0) > 0:
-                labels_0 = [f"#{tid}" for tid in players_team_0.tracker_id]
-                ellipse_0 = sv.EllipseAnnotator(color=sv.Color.from_hex(COLORS[0]), thickness=2)
-                label_0 = sv.LabelAnnotator(
-                    color=sv.Color.from_hex(COLORS[0]),
-                    text_color=sv.Color.from_hex("#FFFFFF"),
-                    text_padding=5,
-                    text_thickness=1,
-                    text_position=sv.Position.BOTTOM_CENTER,
-                )
-                annotated_frame = ellipse_0.annotate(annotated_frame, players_team_0)
-                annotated_frame = label_0.annotate(annotated_frame, players_team_0, labels=labels_0)
-            
-            if len(players_team_1) > 0:
-                labels_1 = [f"#{tid}" for tid in players_team_1.tracker_id]
-                ellipse_1 = sv.EllipseAnnotator(color=sv.Color.from_hex(COLORS[1]), thickness=2)
-                label_1 = sv.LabelAnnotator(
-                    color=sv.Color.from_hex(COLORS[1]),
-                    text_color=sv.Color.from_hex("#FFFFFF"),
-                    text_padding=5,
-                    text_thickness=1,
-                    text_position=sv.Position.BOTTOM_CENTER,
-                )
-                annotated_frame = ellipse_1.annotate(annotated_frame, players_team_1)
-                annotated_frame = label_1.annotate(annotated_frame, players_team_1, labels=labels_1)
-        
-        # Anotar goleiros e árbitros
-        if len(goalkeepers) > 0 and len(goalkeepers_team_id) > 0:
-            goalkeepers_team_0_mask = goalkeepers_team_id == 0
-            goalkeepers_team_1_mask = goalkeepers_team_id == 1
-            
-            goalkeepers_team_0 = goalkeepers[goalkeepers_team_0_mask]
-            goalkeepers_team_1 = goalkeepers[goalkeepers_team_1_mask]
-            
-            if len(goalkeepers_team_0) > 0:
-                labels_gk_0 = [f"#{tid}" for tid in goalkeepers_team_0.tracker_id]
-                ellipse_gk_0 = sv.EllipseAnnotator(color=sv.Color.from_hex(COLORS[0]), thickness=2)
-                label_gk_0 = sv.LabelAnnotator(
-                    color=sv.Color.from_hex(COLORS[0]),
-                    text_color=sv.Color.from_hex("#FFFFFF"),
-                    text_padding=5,
-                    text_thickness=1,
-                    text_position=sv.Position.BOTTOM_CENTER,
-                )
-                annotated_frame = ellipse_gk_0.annotate(annotated_frame, goalkeepers_team_0)
-                annotated_frame = label_gk_0.annotate(annotated_frame, goalkeepers_team_0, labels=labels_gk_0)
-            
-            if len(goalkeepers_team_1) > 0:
-                labels_gk_1 = [f"#{tid}" for tid in goalkeepers_team_1.tracker_id]
-                ellipse_gk_1 = sv.EllipseAnnotator(color=sv.Color.from_hex(COLORS[1]), thickness=2)
-                label_gk_1 = sv.LabelAnnotator(
-                    color=sv.Color.from_hex(COLORS[1]),
-                    text_color=sv.Color.from_hex("#FFFFFF"),
-                    text_padding=5,
-                    text_thickness=1,
-                    text_position=sv.Position.BOTTOM_CENTER,
-                )
-                annotated_frame = ellipse_gk_1.annotate(annotated_frame, goalkeepers_team_1)
-                annotated_frame = label_gk_1.annotate(annotated_frame, goalkeepers_team_1, labels=labels_gk_1)
-        
-        if len(referees) > 0:
-            labels_ref = [f"#{tid}" for tid in referees.tracker_id]
-            ellipse_ref = sv.EllipseAnnotator(color=sv.Color.from_hex(COLORS[2]), thickness=2)
-            label_ref = sv.LabelAnnotator(
-                color=sv.Color.from_hex(COLORS[2]),
-                text_color=sv.Color.from_hex("#FFFFFF"),
-                text_padding=5,
-                text_thickness=1,
-                text_position=sv.Position.BOTTOM_CENTER,
-            )
-            annotated_frame = ellipse_ref.annotate(annotated_frame, referees)
-            annotated_frame = label_ref.annotate(annotated_frame, referees, labels=labels_ref)
-        
-        # Anotar bola
-        annotated_frame = ball_annotator.annotate(annotated_frame, ball_detections)
-        
-        # DETECÇÃO DE IMPEDIMENTO (destacada)
-        if transformer is not None and len(players) > 0:
-            try:
-                offside_ids = offside_detector.detect(
-                    detections=players,
-                    players_team_id=players_team_id,
-                    ball_detections=ball_detections,
-                    transformer=transformer,
-                    config=CONFIG
-                )
-                
-                annotated_frame = offside_detector.annotate(
-                    frame=annotated_frame,
-                    detections=players,
-                    offside_ids=offside_ids
-                )
-                
-                # Adiciona informação de impedimento no frame
-                if offside_ids:
-                    cv2.putText(
-                        annotated_frame,
-                        f"IMPEDIMENTO! Jogadores: {offside_ids}",
-                        (20, 50),
-                        cv2.FONT_HERSHEY_BOLD,
-                        1.0,
-                        (0, 0, 255),
-                        3
-                    )
-                    
-            except Exception as e:
-                print(f"Aviso: Erro na detecção de impedimento: {e}")
-        
-        gc.collect()
-        yield annotated_frame
-
-
 def run_combined_analysis(source_video_path: str, device: str, enable_offside: bool = True) -> Iterator[np.ndarray]:
     """
     Combina detecção de jogadores (com velocidade), rastreamento, classificação de times e detecção de bola.
@@ -896,18 +645,14 @@ def run_combined_analysis(source_video_path: str, device: str, enable_offside: b
     speed_estimator = SpeedEstimator(fps=video_info.fps)
     
     # Inicializa detector de impedimento
-    offside_detector = None
-    if enable_offside and OFFSIDE_AVAILABLE:
-        offside_config = OffsideConfig(
-            debounce_frames=5,
-            min_defenders=2,
-            depth_axis='x',
-            position_tolerance_cm=50.0,
-            enable_annotations=True
-        )
-        offside_detector = OffsideDetector(config=offside_config)
-    elif enable_offside and not OFFSIDE_AVAILABLE:
-        print("AVISO: Detecção de impedimento desabilitada (módulo não disponível)")
+    offside_config = OffsideConfig(
+        debounce_frames=5,
+        min_defenders=2,
+        depth_axis='x',
+        position_tolerance_cm=50.0,
+        enable_annotations=enable_offside
+    )
+    offside_detector = OffsideDetector(config=offside_config) if enable_offside else None
 
     for frame in frame_generator:
         try:
@@ -1170,10 +915,6 @@ def main(
         )
     elif mode == Mode.COMBINED_ANALYSIS:
         frame_generator = run_combined_analysis(
-            source_video_path=source_video_path, device=device
-        )
-    elif mode == Mode.OFFSIDE_DETECTION:
-        frame_generator = run_offside_detection(
             source_video_path=source_video_path, device=device
         )
     else:
