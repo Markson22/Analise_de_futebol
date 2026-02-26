@@ -1,0 +1,12 @@
+LICENSE
+README.md
+pyproject.toml
+setup.py
+sports/__init__.py
+sports.egg-info/PKG-INFO
+sports.egg-info/SOURCES.txt
+sports.egg-info/dependency_links.txt
+sports.egg-info/requires.txt
+sports.egg-info/top_level.txt
+tests/test_offside.py
+tests/test_offside_integration.py
